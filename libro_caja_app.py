@@ -13,6 +13,7 @@
 
 import io
 import re
+import os
 from datetime import datetime
 
 import pandas as pd
@@ -885,8 +886,11 @@ def main():
 
     # ── Sidebar — Parámetros empresa ───────────────────────────────────────
     with st.sidebar:
-        st.image(r"C:\Users\SVS-Contadores_HP\Documents\Libro_Caja\logo.png",
-                 width=120, use_container_width=False)
+        logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+        if os.path.exists(logo_path):
+            st.image(logo_path, width=120, use_container_width=False)
+        else:
+            st.warning("Logo no encontrado")
         st.markdown("---")
         st.subheader("🏢 Datos de la Empresa")
 
