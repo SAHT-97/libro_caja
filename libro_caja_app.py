@@ -1444,9 +1444,16 @@ def main():
                                 max_chars=4)
 
         st.markdown("---")
-        # Saldo inicial eliminado de la barra lateral
-        # Se ingresa directamente en la tabla
-
+        st.subheader("💰 Saldo Inicial")
+        saldo_inicial = st.number_input(
+            "Saldo Inicial ($)",
+            min_value=0,
+            value=0,
+            step=1000,
+            format="%d",
+            help="Ingrese el saldo inicial del libro de caja para el período",
+            key="saldo_inicial_input",
+        )
 
         st.markdown("---")
         st.subheader("ℹ️ Tipo Operación")
@@ -1589,7 +1596,7 @@ def main():
 
                 df_libro_nuevo = generar_libro_caja(
                     df_ventas, df_compras,
-                    0.0,
+                    float(saldo_inicial),
                     rut_empresa or "00.000.000-0",
                     nombre_empresa or "SIN NOMBRE",
                     periodo or "SIN PERÍODO",
