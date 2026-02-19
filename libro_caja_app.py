@@ -138,7 +138,7 @@ def a_numero(valor) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # PROCESAMIENTO VENTAS
 # ─────────────────────────────────────────────────────────────────────────────
-def procesamiento_ventas(archivos_ventas: list, archivos_resumen: list) -> pd.DataFrame:
+def procesamiento_ventas(archivos_ventas: list, archivos_resumen: list, periodo: str = "") -> pd.DataFrame:
     """
     Procesa archivos CSV de ventas (facturas y resúmenes).
     Retorna DataFrame con columnas del Libro de Caja.
@@ -207,7 +207,7 @@ def procesamiento_ventas(archivos_ventas: list, archivos_resumen: list) -> pd.Da
     # ── Resúmenes de ventas (boletas / comprobantes) ──────────────────────────
     for archivo in archivos_resumen:
         df = leer_csv(archivo)
-        _procesar_resumen_ventas(df, archivo.name, registros)
+        _procesar_resumen_ventas(df, archivo.name, registros, periodo)
 
     if not registros:
         return pd.DataFrame()
@@ -271,7 +271,33 @@ def _mapear_columnas_ventas(df: pd.DataFrame) -> dict | None:
     return mapa
 
 
-def _procesar_resumen_ventas(df: pd.DataFrame, nombre: str, registros: list):
+def _fecha_fallback_desde_nombre(nombre_archivo: str, periodo: str) -> pd.Timestamp:
+    """
+    Intenta extraer año y mes del nombre del archivo.
+    Busca patrones como: 2024-11, 202411, nov2024, etc.
+    Si no encuentra nada, usa el 31/12 del año del período.
+    """
+    # Buscar patrón YYYY-MM o YYYYMM en el nombre del archivo
+    match = re.search(r"(\d{4})[_\-]?(\d{2})", nombre_archivo)
+    if match:
+        anio = int(match.group(1))
+        mes = int(match.group(2))
+        if 2000 <= anio <= 2100 and 1 <= mes <= 12:
+            # Último día del mes
+            import calendar
+            ultimo_dia = calendar.monthrange(anio, mes)[1]
+            return pd.Timestamp(f"{anio}-{mes:02d}-{ultimo_dia}")
+
+    # Fallback: último día del año del período ingresado por el usuario
+    anio_periodo = str(periodo).strip()
+    if anio_periodo.isdigit() and len(anio_periodo) == 4:
+        return pd.Timestamp(f"{anio_periodo}-12-31")
+
+    # Último recurso: año actual
+    return pd.Timestamp(f"{datetime.now().year}-12-31")
+
+
+def _procesar_resumen_ventas(df: pd.DataFrame, nombre: str, registros: list, periodo: str = ""):
     """
     Procesa archivo resumen de ventas (boletas y comprobantes por tipo y día).
     Formato esperado: Tipo Documento | Total Documentos | Monto Exento | Monto Neto | Monto IVA | Monto Total
@@ -358,9 +384,12 @@ def _procesar_resumen_ventas(df: pd.DataFrame, nombre: str, registros: list):
         # Fecha
         if col_fecha:
             fecha = parsear_fecha(fila.get(col_fecha, ""))
+            if fecha is None:
+                # Intentar extraer del nombre del archivo cuando la celda no parsea
+                fecha = _fecha_fallback_desde_nombre(nombre, periodo)
         else:
-            # Sin fecha: asignar fecha ficticia (fin de período) para resúmenes mensuales
-            fecha = pd.Timestamp.now().normalize()
+            # Sin columna fecha: extraer del nombre del archivo o usar período
+            fecha = _fecha_fallback_desde_nombre(nombre, periodo)
 
         if fecha is None:
             continue
@@ -981,6 +1010,7 @@ def main():
                     df_ventas = procesamiento_ventas(
                         archivos_ventas or [],
                         archivos_resumen or [],
+                        periodo or "",
                     )
                 except Exception as e:
                     st.error(f"❌ Error procesando ventas: {e}")
