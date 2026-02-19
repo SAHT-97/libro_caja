@@ -23,6 +23,8 @@ from openpyxl.styles import (
     Alignment, Border, Font, PatternFill, Side
 )
 from openpyxl.utils import get_column_letter
+from fpdf import FPDF
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTES
@@ -153,6 +155,14 @@ def procesamiento_ventas(archivos_ventas: list, archivos_resumen: list, periodo:
             st.warning(f"⚠️ No se reconocieron columnas en {archivo.name}. Se omite.")
             continue
 
+        # Pre-scan: construir diccionario folio → fecha para filas duplicadas sin fecha
+        fechas_por_folio = {}
+        for _, f in df.iterrows():
+            folio_tmp = str(f.get(col_map.get("folio", ""), "")).strip()
+            fecha_tmp = parsear_fecha(f.get(col_map.get("fecha", ""), ""))
+            if folio_tmp and fecha_tmp is not None:
+                fechas_por_folio[folio_tmp] = fecha_tmp
+
         for _, fila in df.iterrows():
             tipo_doc_raw = a_numero(fila.get(col_map.get("tipo_doc", ""), 0))
             tipo_doc = int(tipo_doc_raw) if tipo_doc_raw else 0
@@ -161,19 +171,21 @@ def procesamiento_ventas(archivos_ventas: list, archivos_resumen: list, periodo:
             if tipo_doc not in FACTURAS_VENTA + NOTAS_CREDITO + NOTAS_DEBITO:
                 continue
 
+            folio = str(fila.get(col_map.get("folio", ""), "")).strip()
+
             fecha = parsear_fecha(fila.get(col_map.get("fecha", ""), ""))
+            if fecha is None:
+                # Buscar fecha del mismo documento (folio)
+                fecha = fechas_por_folio.get(folio)
             if fecha is None:
                 continue
 
-            folio = str(fila.get(col_map.get("folio", ""), "")).strip()
             rut_cliente = str(fila.get(col_map.get("rut", ""), "")).strip()
             razon = str(fila.get(col_map.get("razon", ""), "")).strip()
             monto_neto = a_numero(fila.get(col_map.get("neto", ""), 0))
             monto_exento = a_numero(fila.get(col_map.get("exento", ""), 0))
             monto_total = a_numero(fila.get(col_map.get("total", ""), 0))
 
-            if monto_total == 0:
-                continue
 
             # Determinar tipo operación y montos según tipo de documento
             if tipo_doc in NOTAS_CREDITO:
@@ -378,8 +390,6 @@ def _procesar_resumen_ventas(df: pd.DataFrame, nombre: str, registros: list, per
         monto_exento = a_numero(fila.get(col_exento, 0) if col_exento else 0)
         monto_total = a_numero(fila.get(col_total, 0) if col_total else 0)
 
-        if monto_total == 0:
-            continue
 
         # Fecha
         if col_fecha:
@@ -420,6 +430,95 @@ def _procesar_resumen_ventas(df: pd.DataFrame, nombre: str, registros: list, per
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROCESAMIENTO DATOS F29 (PEGADO DE TEXTO)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def procesar_texto_f29(texto: str) -> pd.DataFrame:
+    """
+    Procesa datos de pagos F29 pegados como texto.
+    Formato esperado (separado por comas):
+        C2, C3 (Folio), C4 (Descripción), C6 (Fecha), C7 (Detalle), C9 (Monto)
+    Ejemplo:
+        2,8091536376,Formulario F-29,06/02/2025,Pago del F-29,"$151,077"
+    Retorna un DataFrame con formato de Libro de Caja.
+    """
+    if not texto or not texto.strip():
+        return pd.DataFrame()
+
+    data = []
+    lineas = texto.strip().splitlines()
+
+    # Detectar si la primera línea es un encabezado
+    primera = lineas[0].strip().lower()
+    if "folio" in primera or "descripción" in primera or "descripcion" in primera or "monto" in primera or "c2" in primera:
+        lineas = lineas[1:]  # saltar encabezado
+
+    for num_linea, linea in enumerate(lineas, start=1):
+        linea = linea.strip()
+        if not linea:
+            continue
+
+        # Parsear con csv.reader para manejar comillas y comas dentro de valores
+        import csv
+        try:
+            partes = list(csv.reader([linea]))[0]
+        except Exception:
+            st.warning(f"⚠️ Línea {num_linea}: no se pudo parsear → '{linea}'")
+            continue
+
+        # Limpiar espacios
+        partes = [p.strip() for p in partes]
+
+        if len(partes) < 6:
+            st.warning(f"⚠️ Línea {num_linea}: se esperan 6 campos, se encontraron {len(partes)} → '{linea}'")
+            continue
+
+        try:
+            tipo_op = int(partes[0])          # C2 — Tipo Operación (1=Ingreso, 2=Egreso)
+            folio = partes[1].strip()          # C3 — N° Documento / Folio
+            descripcion = partes[2].strip()    # C4 — Tipo Documento (ej: Formulario F-29)
+            fecha_str = partes[3].strip()      # C6 — Fecha Presentación
+            detalle = partes[4].strip()        # C7 — Glosa / Detalle
+            monto_str = partes[5].strip()      # C9 — Monto
+
+            # Parsear fecha
+            fecha_dt = parsear_fecha(fecha_str)
+            if fecha_dt is None:
+                st.warning(f"⚠️ Línea {num_linea}: fecha inválida '{fecha_str}'")
+                continue
+
+            # Limpiar monto: quitar $, puntos de miles, espacios
+            monto_limpio = monto_str.replace("$", "").replace(".", "").replace(",", "").replace(" ", "").strip()
+            if not monto_limpio.lstrip("-").isdigit():
+                st.warning(f"⚠️ Línea {num_linea}: monto inválido '{monto_str}'")
+                continue
+            monto = abs(int(monto_limpio))
+
+            data.append({
+                "Tipo Operación": tipo_op,
+                "N° Documento": folio,
+                "Tipo Documento": descripcion,
+                "RUT Emisor": "",
+                "Fecha Operación": fecha_dt,
+                "Glosa de Operación": detalle,
+                "C8": monto,
+                "C9": 0,
+                "_origen": "f29_texto"
+            })
+
+        except ValueError as e:
+            st.warning(f"⚠️ Línea {num_linea}: error de valor → {e}")
+            continue
+
+    if not data:
+        st.warning("⚠️ No se encontraron datos válidos en el texto pegado.")
+        return pd.DataFrame()
+
+    st.success(f"✅ Se procesaron {len(data)} registros de F29 desde el texto.")
+    return pd.DataFrame(data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PROCESAMIENTO COMPRAS
 # ─────────────────────────────────────────────────────────────────────────────
 def procesamiento_compras(archivos_compras: list) -> pd.DataFrame:
@@ -433,40 +532,68 @@ def procesamiento_compras(archivos_compras: list) -> pd.DataFrame:
             st.warning(f"⚠️ No se reconocieron columnas en {archivo.name}. Se omite.")
             continue
 
+        # Pre-scan: construir diccionario folio → fecha para filas duplicadas sin fecha
+        fechas_por_folio = {}
+        for _, f in df.iterrows():
+            folio_tmp = str(f.get(col_map.get("folio", ""), "")).strip()
+            fecha_tmp = parsear_fecha(f.get(col_map.get("fecha", ""), ""))
+            if folio_tmp and fecha_tmp is not None:
+                fechas_por_folio[folio_tmp] = fecha_tmp
+
         for _, fila in df.iterrows():
             tipo_doc_raw = a_numero(fila.get(col_map.get("tipo_doc", ""), 0))
             tipo_doc = int(tipo_doc_raw) if tipo_doc_raw else 0
 
+            folio = str(fila.get(col_map.get("folio", ""), "")).strip()
+
             fecha = parsear_fecha(fila.get(col_map.get("fecha", ""), ""))
             if fecha is None:
+                # Buscar fecha del mismo documento (folio)
+                fecha = fechas_por_folio.get(folio)
+            if fecha is None:
                 continue
-
-            folio = str(fila.get(col_map.get("folio", ""), "")).strip()
             rut_prov = str(fila.get(col_map.get("rut", ""), "")).strip()
             razon = str(fila.get(col_map.get("razon", ""), "")).strip()
             monto_neto = a_numero(fila.get(col_map.get("neto", ""), 0))
             monto_exento = a_numero(fila.get(col_map.get("exento", ""), 0))
             monto_total = a_numero(fila.get(col_map.get("total", ""), 0))
 
-            if monto_total == 0:
-                continue
+            # Columnas adicionales que afectan la base imponible en COMPRAS
+            neto_activo_fijo = a_numero(fila.get(col_map.get("neto_activo_fijo", ""), 0))
+            iva_no_recuperable = a_numero(fila.get(col_map.get("iva_no_recuperable", ""), 0))
+            tab_puros = a_numero(fila.get(col_map.get("tab_puros", ""), 0))
+            tab_cigarrillos = a_numero(fila.get(col_map.get("tab_cigarrillos", ""), 0))
+            tab_elaborados = a_numero(fila.get(col_map.get("tab_elaborados", ""), 0))
+            impto_sin_credito = a_numero(fila.get(col_map.get("impto_sin_credito", ""), 0))
+            otro_impuesto = a_numero(fila.get(col_map.get("otro_impuesto", ""), 0))
+
+
+            # C9 para compras: Neto + Exento + Neto Activo Fijo
+            #   + IVA No Recuperable + Tabacos (puros+cigarrillos+elaborados)
+            #   + Impto. Sin Derecho a Crédito + Valor Otro Impuesto
+            base_imponible = (monto_neto + monto_exento
+                              + neto_activo_fijo
+                              + iva_no_recuperable
+                              + tab_puros + tab_cigarrillos + tab_elaborados
+                              + impto_sin_credito
+                              + otro_impuesto)
 
             if tipo_doc in NOTAS_CREDITO:
                 # NC de proveedor: reembolso → ingreso, aumenta base imponible
                 tipo_op = 1
                 c8 = abs(monto_total)
-                c9 = abs(monto_neto + monto_exento)
+                c9 = abs(base_imponible)
                 glosa = f"NC Compra — {razon}"
             elif tipo_doc in NOTAS_DEBITO:
                 # ND de proveedor: pago adicional → egreso, disminuye base imponible
                 tipo_op = 2
                 c8 = abs(monto_total)
-                c9 = abs(monto_neto + monto_exento)
+                c9 = abs(base_imponible)
                 glosa = f"ND Compra — {razon}"
             else:
                 tipo_op = 2  # Egreso
                 c8 = abs(monto_total)
-                c9 = abs(monto_neto + monto_exento)
+                c9 = abs(base_imponible)
                 glosa = f"Compra — {razon}"
 
             registros.append({
@@ -535,9 +662,145 @@ def _mapear_columnas_compras(df: pd.DataFrame) -> dict | None:
             mapa["total"] = cols[k]
             break
 
+    # ── Columnas adicionales que afectan Base Imponible en Compras ────────
+    for k in ["monto neto activo fijo", "monto_neto_activo_fijo",
+              "neto activo fijo", "neto_activo_fijo"]:
+        if k in cols:
+            mapa["neto_activo_fijo"] = cols[k]
+            break
+
+    for k in ["monto iva no recuperable", "monto_iva_no_recuperable",
+              "iva no recuperable", "iva_no_recuperable",
+              "monto iva no rec.", "iva no rec."]:
+        if k in cols:
+            mapa["iva_no_recuperable"] = cols[k]
+            break
+
+    for k in ["tabacos puros", "tabacos_puros",
+              "monto imp. tab. puros", "tab. puros",
+              "mto imp. tab. puros", "imp tab puros",
+              "tabacos puros no nominados"]:
+        if k in cols:
+            mapa["tab_puros"] = cols[k]
+            break
+
+    for k in ["mto imp. tab. cigarrillos", "tab. cigarrillos",
+              "tabacos cigarrillos", "cigarrillos",
+              "imp tab cigarrillos"]:
+        if k in cols:
+            mapa["tab_cigarrillos"] = cols[k]
+            break
+
+    for k in ["mto imp. tab. elaborados", "tab. elaborados",
+              "tabacos elaborados", "elaborados",
+              "imp tab elaborados"]:
+        if k in cols:
+            mapa["tab_elaborados"] = cols[k]
+            break
+
+    for k in ["impto. sin derecho a crédito", "impto sin derecho a credito",
+              "impto_sin_credito", "monto sin derecho a credito",
+              "imp. sin derecho a crédito", "imp sin derecho a credito",
+              "sin derecho a credito"]:
+        if k in cols:
+            mapa["impto_sin_credito"] = cols[k]
+            break
+
+    for k in ["valor otro impuesto", "otro impuesto", "otros impuestos",
+              "otro_impuesto", "otros impuestos sin credito"]:
+        if k in cols:
+            mapa["otro_impuesto"] = cols[k]
+            break
+
     if "tipo_doc" not in mapa or "fecha" not in mapa:
         return None
     return mapa
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCESAMIENTO HONORARIOS (Excel)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def procesar_texto_honorarios(texto: str) -> pd.DataFrame:
+    """
+    Procesa texto pegado con datos de boletas de honorarios.
+    Formato esperado (CSV): C2,C3,C4,C5,C6,C7,C8,C9
+    Ejemplo: 2,1389,Boleta de Honorarios Electrónica,13064992-0,05/09/2024,ALEJANDRO PATRICIO DUQUE SOTO,108684,108684
+    """
+    data = []
+    lineas = texto.strip().splitlines()
+
+    for num_linea, linea in enumerate(lineas, start=1):
+        linea = linea.strip()
+        if not linea:
+            continue
+
+        # Detectar y omitir líneas de encabezado
+        linea_lower = linea.lower()
+        if linea_lower.startswith("c2") or "tipo" in linea_lower and "operaci" in linea_lower:
+            continue
+
+        import csv
+        try:
+            partes = list(csv.reader([linea]))[0]
+        except Exception:
+            st.warning(f"⚠️ Línea {num_linea}: no se pudo parsear → '{linea}'")
+            continue
+
+        partes = [p.strip() for p in partes]
+
+        if len(partes) < 8:
+            st.warning(f"⚠️ Línea {num_linea}: se esperan 8 campos (C2-C9), se encontraron {len(partes)} → '{linea}'")
+            continue
+
+        try:
+            tipo_op = int(partes[0])             # C2 — Tipo Operación (siempre 2 = Egreso)
+            numero = partes[1].strip()            # C3 — N° Documento
+            tipo_doc = partes[2].strip()          # C4 — Tipo Documento
+            rut = partes[3].strip()               # C5 — RUT Emisor
+            fecha_str = partes[4].strip()         # C6 — Fecha
+            nombre = partes[5].strip()            # C7 — Nombre o Razón Social
+            monto_c8_str = partes[6].strip()      # C8 — Pagado
+            monto_c9_str = partes[7].strip()      # C9 — Bruto
+
+            # Parsear fecha
+            fecha_dt = parsear_fecha(fecha_str)
+            if fecha_dt is None:
+                st.warning(f"⚠️ Línea {num_linea}: fecha inválida '{fecha_str}'")
+                continue
+
+            # Limpiar montos
+            c8_limpio = monto_c8_str.replace("$", "").replace(".", "").replace(",", "").replace(" ", "").strip()
+            c9_limpio = monto_c9_str.replace("$", "").replace(".", "").replace(",", "").replace(" ", "").strip()
+
+            c8 = abs(int(c8_limpio)) if c8_limpio.lstrip("-").isdigit() else 0
+            c9 = abs(int(c9_limpio)) if c9_limpio.lstrip("-").isdigit() else 0
+
+            if c8 == 0 and c9 == 0:
+                continue
+
+            data.append({
+                "Tipo Operación": tipo_op,
+                "N° Documento": numero,
+                "Tipo Documento": tipo_doc if tipo_doc else "Boleta de Honorarios Electrónica",
+                "RUT Emisor": rut,
+                "Fecha Operación": fecha_dt,
+                "Glosa de Operación": nombre,
+                "C8": c8,
+                "C9": c9,
+                "_origen": "honorarios_texto"
+            })
+
+        except ValueError as e:
+            st.warning(f"⚠️ Línea {num_linea}: error de valor → {e}")
+            continue
+
+    if not data:
+        st.warning("⚠️ No se encontraron datos válidos de honorarios en el texto pegado.")
+        return pd.DataFrame()
+
+    st.success(f"✅ Se procesaron {len(data)} boletas de honorarios desde el texto.")
+    return pd.DataFrame(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -772,42 +1035,130 @@ def exportar_excel(
     fila_sep = fila_inicio + len(df)
     ws.merge_cells(f"A{fila_sep}:I{fila_sep}")
     ws[f"A{fila_sep}"].fill = PatternFill("solid", start_color=AZUL_HEADER)
+    ws.row_dimensions[fila_sep].height = 6
 
-    # ── Totales ────────────────────────────────────────────────────────────
-    fila_tot = fila_sep + 1
-    totales_data = [
-        ("TOTAL FLUJO INGRESOS (C10)", totales["total_ingresos"], VERDE),
-        ("TOTAL FLUJO EGRESOS (C11)", totales["total_egresos"], ROJO),
-        ("SALDO FLUJO DE CAJA (C12)", totales["saldo_flujo"],
-         VERDE if totales["saldo_flujo"] >= 0 else ROJO),
-        ("INGRESOS BASE IMPONIBLE (C13)", totales["ing_bi"], VERDE),
-        ("EGRESOS BASE IMPONIBLE (C14)", totales["egr_bi"], ROJO),
-        ("RESULTADO NETO (C15)", totales["resultado_neto"],
-         VERDE if totales["resultado_neto"] >= 0 else ROJO),
+    # ── SALDOS Y TOTALES LIBRO DE CAJA (formato oficial SII) ──────────────
+    NEGRO = "000000"
+    AMARILLO_HEADER = "FFC000"
+    AMARILLO_CLARO = "FFF2CC"
+
+    # Fila 1: Título principal
+    f1 = fila_sep + 1
+    ws.merge_cells(f"A{f1}:I{f1}")
+    cell_t = ws[f"A{f1}"]
+    cell_t.value = "SALDOS Y TOTALES LIBRO DE CAJA"
+    cell_t.font = Font(name="Arial", bold=True, color=NEGRO, size=10)
+    cell_t.fill = PatternFill("solid", start_color=AMARILLO_HEADER)
+    cell_t.alignment = Alignment(horizontal="center", vertical="center")
+    cell_t.border = borde_fino
+    for col in range(2, 10):
+        ws.cell(row=f1, column=col).border = borde_fino
+        ws.cell(row=f1, column=col).fill = PatternFill("solid", start_color=AMARILLO_HEADER)
+    ws.row_dimensions[f1].height = 22
+
+    # Fila 2: Sub-encabezados de grupo
+    f2 = f1 + 1
+    ws.merge_cells(f"A{f2}:F{f2}")
+    cell_flujo = ws[f"A{f2}"]
+    cell_flujo.value = "FLUJO DE INGRESOS Y EGRESOS"
+    cell_flujo.font = Font(name="Arial", bold=True, color=NEGRO, size=9)
+    cell_flujo.fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+    cell_flujo.alignment = Alignment(horizontal="center", vertical="center")
+    cell_flujo.border = borde_fino
+    for col in range(2, 7):
+        ws.cell(row=f2, column=col).border = borde_fino
+        ws.cell(row=f2, column=col).fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+
+    ws.merge_cells(f"G{f2}:I{f2}")
+    cell_bi = ws[f"G{f2}"]
+    cell_bi.value = "MONTOS QUE AFECTAN LA BASE IMPONIBLE"
+    cell_bi.font = Font(name="Arial", bold=True, color=NEGRO, size=9)
+    cell_bi.fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+    cell_bi.alignment = Alignment(horizontal="center", vertical="center")
+    cell_bi.border = borde_fino
+    for col in range(8, 10):
+        ws.cell(row=f2, column=col).border = borde_fino
+        ws.cell(row=f2, column=col).fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+    ws.row_dimensions[f2].height = 20
+
+    # Fila 3: Etiquetas de cada total
+    f3 = f2 + 1
+    labels_row3 = [
+        (1, 2, "TOTAL MONTO\nFLUJO DE\nINGRESOS"),
+        (3, 4, "TOTAL MONTO FLUJO\nDE EGRESOS"),
+        (5, 6, "SALDO FLUJO DE\nCAJA"),
+        (7, 7, "INGRESOS"),
+        (8, 8, "EGRESOS"),
+        (9, 9, "RESULTADO\nNETO"),
     ]
+    for col_ini, col_fin, texto in labels_row3:
+        if col_ini != col_fin:
+            ws.merge_cells(start_row=f3, start_column=col_ini, end_row=f3, end_column=col_fin)
+        cell = ws.cell(row=f3, column=col_ini)
+        cell.value = texto
+        cell.font = Font(name="Arial", bold=True, color=NEGRO, size=8)
+        cell.fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = borde_fino
+        if col_ini != col_fin:
+            for c in range(col_ini + 1, col_fin + 1):
+                ws.cell(row=f3, column=c).border = borde_fino
+                ws.cell(row=f3, column=c).fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+    ws.row_dimensions[f3].height = 38
 
-    for i, (label, valor, fondo) in enumerate(totales_data):
-        fila = fila_tot + i
-        ws.merge_cells(f"A{fila}:G{fila}")
-        cell_label = ws[f"A{fila}"]
-        cell_label.value = label
-        cell_label.font = Font(name="Arial", bold=True, size=9)
-        cell_label.fill = PatternFill("solid", start_color=fondo)
-        cell_label.alignment = Alignment(horizontal="right", vertical="center")
-        cell_label.border = borde_fino
+    # Fila 4: Códigos C10-C15
+    f4 = f3 + 1
+    codigos = [
+        (1, 2, "C10"),
+        (3, 4, "C11"),
+        (5, 6, "C12"),
+        (7, 7, "C13"),
+        (8, 8, "C14"),
+        (9, 9, "C15"),
+    ]
+    for col_ini, col_fin, codigo in codigos:
+        if col_ini != col_fin:
+            ws.merge_cells(start_row=f4, start_column=col_ini, end_row=f4, end_column=col_fin)
+        cell = ws.cell(row=f4, column=col_ini)
+        cell.value = codigo
+        cell.font = Font(name="Arial", bold=True, color=NEGRO, size=9)
+        cell.fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = borde_fino
+        if col_ini != col_fin:
+            for c in range(col_ini + 1, col_fin + 1):
+                ws.cell(row=f4, column=c).border = borde_fino
+                ws.cell(row=f4, column=c).fill = PatternFill("solid", start_color=AMARILLO_CLARO)
+    ws.row_dimensions[f4].height = 18
 
-        ws.merge_cells(f"H{fila}:I{fila}")
-        cell_val = ws[f"H{fila}"]
-        cell_val.value = valor
-        cell_val.font = Font(name="Arial", bold=True, size=9)
-        cell_val.fill = PatternFill("solid", start_color=fondo)
-        cell_val.number_format = '#,##0'
-        cell_val.alignment = Alignment(horizontal="right", vertical="center")
-        cell_val.border = borde_fino
-        ws.row_dimensions[fila].height = 18
+    # Fila 5: Valores C10-C15
+    f5 = f4 + 1
+    valores_totales = [
+        (1, 2, totales["total_ingresos"]),
+        (3, 4, totales["total_egresos"]),
+        (5, 6, totales["saldo_flujo"]),
+        (7, 7, totales["ing_bi"]),
+        (8, 8, totales["egr_bi"]),
+        (9, 9, totales["resultado_neto"]),
+    ]
+    for col_ini, col_fin, valor in valores_totales:
+        if col_ini != col_fin:
+            ws.merge_cells(start_row=f5, start_column=col_ini, end_row=f5, end_column=col_fin)
+        cell = ws.cell(row=f5, column=col_ini)
+        cell.value = valor
+        cell.font = Font(name="Arial", bold=True, color=NEGRO, size=10)
+        cell.fill = PatternFill("solid", start_color=BLANCO)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = borde_fino
+        cell.number_format = '#,##0'
+        if col_ini != col_fin:
+            for c in range(col_ini + 1, col_fin + 1):
+                ws.cell(row=f5, column=c).border = borde_fino
+                ws.cell(row=f5, column=c).fill = PatternFill("solid", start_color=BLANCO)
+    ws.row_dimensions[f5].height = 22
 
     # ── Pie de página ──────────────────────────────────────────────────────
-    fila_pie = fila_tot + len(totales_data) + 1
+    fila_pie = f5 + 2
     ws.merge_cells(f"A{fila_pie}:I{fila_pie}")
     ws[f"A{fila_pie}"].value = (
         "Documento generado conforme al Art. 14 D N°3 y N°8(a) LIR — Régimen Pro Pyme — SII Chile"
@@ -819,6 +1170,166 @@ def exportar_excel(
     # ── Guardar en memoria ─────────────────────────────────────────────────
     buffer = io.BytesIO()
     wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORTACIÓN PDF (solo totales)
+# ─────────────────────────────────────────────────────────────────────────────
+def exportar_pdf_totales(
+    totales: dict,
+    rut_empresa: str,
+    nombre_empresa: str,
+    periodo: str,
+) -> bytes:
+    """Genera un PDF con la tabla de Saldos y Totales del Libro de Caja."""
+
+    def fmt(v):
+        signo = "-" if v < 0 else ""
+        return f"{signo}${abs(v):,.0f}".replace(",", ".")
+
+    def safe(text: str) -> str:
+        """Reemplaza caracteres fuera de latin-1 para compatibilidad con Helvetica."""
+        reemplazos = {
+            "\u2014": "-", "\u2013": "-",  # em-dash, en-dash
+            "\u00b0": "o.",                 # °  → o.
+            "\u201c": '"', "\u201d": '"',   # comillas tipográficas
+            "\u2018": "'", "\u2019": "'",
+        }
+        for viejo, nuevo in reemplazos.items():
+            text = text.replace(viejo, nuevo)
+        # Asegurar que todo sea encodeable a latin-1
+        return text.encode("latin-1", errors="replace").decode("latin-1")
+
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=False)
+
+    # ── Colores ────────────────────────────────────────────────────────────
+    DORADO = (255, 192, 0)
+    AMARILLO = (255, 242, 204)
+    AZUL_OSC = (31, 56, 100)
+    BLANCO = (255, 255, 255)
+    NEGRO = (0, 0, 0)
+
+    page_w = 297  # A4 landscape
+    margen = 15
+    tabla_w = page_w - 2 * margen
+
+    # ── Título SII ─────────────────────────────────────────────────────────
+    pdf.set_fill_color(*AZUL_OSC)
+    pdf.set_text_color(*BLANCO)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_xy(margen, 12)
+    pdf.cell(tabla_w, 12,
+             safe("ANEXO 3. LIBRO DE CAJA - REGIMEN PRO PYME (Art. 14 D No.3 y No.8 LIR)"),
+             border=1, align="C", fill=True)
+
+    # ── Datos empresa ──────────────────────────────────────────────────────
+    pdf.set_text_color(*NEGRO)
+    pdf.set_fill_color(242, 242, 242)
+    pdf.set_font("Helvetica", "B", 9)
+
+    y_datos = 28
+    col_label_w = 50
+    col_val_w = tabla_w - col_label_w
+
+    for label, valor in [("PERIODO:", periodo),
+                         ("RUT:", rut_empresa),
+                         ("NOMBRE / RAZON SOCIAL:", nombre_empresa)]:
+        pdf.set_xy(margen, y_datos)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(col_label_w, 7, safe(label), border=1, fill=True)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(col_val_w, 7, safe(valor), border=1, fill=True)
+        y_datos += 7
+
+    # ── Tabla de totales ───────────────────────────────────────────────────
+    y_tabla = y_datos + 8
+
+    # Anchos de las 6 columnas
+    col_w = tabla_w / 6
+
+    # Fila 1: Título principal
+    pdf.set_xy(margen, y_tabla)
+    pdf.set_fill_color(*DORADO)
+    pdf.set_text_color(*NEGRO)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(tabla_w, 10, "SALDOS Y TOTALES LIBRO DE CAJA",
+             border=1, align="C", fill=True)
+    y_tabla += 10
+
+    # Fila 2: Sub-grupos
+    pdf.set_xy(margen, y_tabla)
+    pdf.set_fill_color(*AMARILLO)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(col_w * 3, 8, "FLUJO DE INGRESOS Y EGRESOS",
+             border=1, align="C", fill=True)
+    pdf.cell(col_w * 3, 8, "MONTOS QUE AFECTAN LA BASE IMPONIBLE",
+             border=1, align="C", fill=True)
+    y_tabla += 8
+
+    # Fila 3: Etiquetas
+    pdf.set_xy(margen, y_tabla)
+    pdf.set_fill_color(*AMARILLO)
+    pdf.set_font("Helvetica", "B", 7)
+    labels = [
+        "TOTAL MONTO\nFLUJO DE\nINGRESOS",
+        "TOTAL MONTO\nFLUJO DE\nEGRESOS",
+        "SALDO FLUJO\nDE CAJA",
+        "INGRESOS",
+        "EGRESOS",
+        "RESULTADO\nNETO",
+    ]
+    h_labels = 14
+    for lb in labels:
+        x_pos = pdf.get_x()
+        pdf.set_fill_color(*AMARILLO)
+        pdf.rect(x_pos, y_tabla, col_w, h_labels, "DF")
+        # Centrar texto multi-linea
+        lines = lb.split("\n")
+        line_h = h_labels / max(len(lines), 1)
+        for j, line in enumerate(lines):
+            pdf.set_xy(x_pos, y_tabla + j * line_h + (h_labels - len(lines) * line_h) / 2)
+            pdf.cell(col_w, line_h, line, align="C")
+        pdf.set_xy(x_pos + col_w, y_tabla)
+    y_tabla += h_labels
+
+    # Fila 4: Códigos C10-C15
+    pdf.set_xy(margen, y_tabla)
+    pdf.set_fill_color(*AMARILLO)
+    pdf.set_font("Helvetica", "B", 9)
+    for code in ["C10", "C11", "C12", "C13", "C14", "C15"]:
+        pdf.cell(col_w, 7, code, border=1, align="C", fill=True)
+    y_tabla += 7
+
+    # Fila 5: Valores
+    pdf.set_xy(margen, y_tabla)
+    pdf.set_fill_color(*BLANCO)
+    pdf.set_font("Helvetica", "B", 11)
+    valores = [
+        totales["total_ingresos"],
+        totales["total_egresos"],
+        totales["saldo_flujo"],
+        totales["ing_bi"],
+        totales["egr_bi"],
+        totales["resultado_neto"],
+    ]
+    for val in valores:
+        pdf.cell(col_w, 10, fmt(val), border=1, align="C", fill=True)
+    y_tabla += 10
+
+    # ── Pie de página ──────────────────────────────────────────────────────
+    pdf.set_xy(margen, y_tabla + 6)
+    pdf.set_font("Helvetica", "I", 7)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(tabla_w, 5,
+             safe("Documento generado conforme al Art. 14 D No.3 y No.8(a) LIR - Regimen Pro Pyme - SII Chile"),
+             align="C")
+
+    buffer = io.BytesIO()
+    pdf.output(buffer)
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -985,6 +1496,39 @@ def main():
             help="Suba uno o más archivos CSV con el detalle de compras"
         )
 
+    # ── Datos pegados (F29 y Honorarios) dentro de expanders ──────────────
+    with st.expander("🔵 Pagos F29 (Pegar Datos)", expanded=False):
+        st.markdown("""
+        <div style="background:#e8f0fe; border-left:4px solid #1a73e8; padding:10px; border-radius:4px; margin-bottom:10px; font-size:0.85em;">
+            <strong>📋 Formato esperado</strong> (6 campos por fila, separados por comas):<br>
+            <code>C2, Folio, Descripción, Fecha, Detalle, Monto</code><br>
+            <em>Ejemplo:</em> <code>2,8091536376,Formulario F-29,06/02/2025,Pago del F-29,"$151,077"</code>
+        </div>
+        """, unsafe_allow_html=True)
+        texto_f29 = st.text_area(
+            "Pegar datos F29",
+            height=150,
+            key="f29_texto",
+            placeholder="2,8091536376,Formulario F-29,06/02/2025,Pago del F-29,\"$151,077\"\n2,8116188706,Formulario F-29,12/03/2025,Pago del F-29,\"$139,050\"\n...",
+            help="Pegue aquí los datos de los pagos de F29."
+        )
+
+    with st.expander("🟣 Honorarios (Pegar Datos)", expanded=False):
+        st.markdown("""
+        <div style="background:#f3e8fe; border-left:4px solid #9b59b6; padding:10px; border-radius:4px; margin-bottom:10px; font-size:0.85em;">
+            <strong>📋 Formato esperado</strong> (8 campos por fila, separados por comas):<br>
+            <code>C2, N° Documento, Tipo Doc, RUT, Fecha, Nombre, Pagado, Bruto</code><br>
+            <em>Ejemplo:</em> <code>2,1389,Boleta de Honorarios Electrónica,13064992-0,05/09/2024,ALEJANDRO PATRICIO DUQUE SOTO,108684,108684</code>
+        </div>
+        """, unsafe_allow_html=True)
+        texto_honorarios = st.text_area(
+            "Pegar datos Honorarios",
+            height=150,
+            key="honorarios_texto",
+            placeholder="2,1389,Boleta de Honorarios Electrónica,13064992-0,05/09/2024,ALEJANDRO PATRICIO DUQUE SOTO,108684,108684\n...",
+            help="Pegue aquí los datos de las boletas de honorarios."
+        )
+
     # ── Botón procesar ─────────────────────────────────────────────────────
     st.markdown("---")
     col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
@@ -993,8 +1537,10 @@ def main():
 
     # Cuando se presiona el botón, regenerar desde cero y guardar en session_state
     if boton_generar:
-        if not archivos_ventas and not archivos_resumen and not archivos_compras:
-            st.error("❌ Debe cargar al menos un archivo CSV para procesar.")
+        tiene_texto_f29 = texto_f29 and texto_f29.strip()
+        tiene_texto_honorarios = texto_honorarios and texto_honorarios.strip()
+        if not archivos_ventas and not archivos_resumen and not archivos_compras and not tiene_texto_f29 and not tiene_texto_honorarios:
+            st.error("❌ Debe cargar al menos un archivo o pegar datos para procesar.")
         else:
             if not rut_empresa or not nombre_empresa or not periodo:
                 st.warning("⚠️ Complete los datos de la empresa en el panel lateral antes de procesar.")
@@ -1018,6 +1564,28 @@ def main():
                         df_compras = procesamiento_compras(archivos_compras)
                     except Exception as e:
                         st.error(f"❌ Error procesando compras: {e}")
+
+                if tiene_texto_honorarios:
+                    try:
+                        df_honorarios = procesar_texto_honorarios(texto_honorarios)
+                        if not df_honorarios.empty:
+                            if df_compras.empty:
+                                df_compras = df_honorarios
+                            else:
+                                df_compras = pd.concat([df_compras, df_honorarios], ignore_index=True)
+                    except Exception as e:
+                        st.error(f"❌ Error procesando honorarios: {e}")
+
+                if tiene_texto_f29:
+                    try:
+                        df_f29 = procesar_texto_f29(texto_f29)
+                        if not df_f29.empty:
+                            if df_compras.empty:
+                                df_compras = df_f29
+                            else:
+                                df_compras = pd.concat([df_compras, df_f29], ignore_index=True)
+                    except Exception as e:
+                        st.error(f"❌ Error procesando datos F29: {e}")
 
                 df_libro_nuevo = generar_libro_caja(
                     df_ventas, df_compras,
@@ -1225,33 +1793,90 @@ def main():
     col_l2.markdown("🟢 **Flujo Ingreso**")
     col_l3.markdown("🔴 **Flujo Egreso**")
 
-    # ── KPIs ──────────────────────────────────────────────────────────────
-    st.markdown("## 📊 Resumen del Período")
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    # ── Totales — formato oficial SII ──────────────────────────────────────
+    st.markdown("## 📊 Saldos y Totales Libro de Caja")
+
     def fmt_clp(v):
-        return f"${v:,.0f}".replace(",", ".")
+        signo = "-" if v < 0 else ""
+        return f"{signo}${abs(v):,.0f}".replace(",", ".")
 
-    k1.metric("Total Ingresos (C10)", fmt_clp(totales["total_ingresos"]))
-    k2.metric("Total Egresos (C11)", fmt_clp(totales["total_egresos"]))
-    k3.metric("Saldo Flujo Caja (C12)", fmt_clp(totales["saldo_flujo"]))
-    k4.metric("Ingresos BI (C13)", fmt_clp(totales["ing_bi"]))
-    k5.metric("Egresos BI (C14)", fmt_clp(totales["egr_bi"]))
-    resultado_delta = "▲ Positivo" if totales["resultado_neto"] >= 0 else "▼ Negativo"
-    k6.metric("Resultado Neto (C15)", fmt_clp(totales["resultado_neto"]), delta=resultado_delta)
+    # Tabla HTML con el formato del SII
+    saldo_color = "#27ae60" if totales["saldo_flujo"] >= 0 else "#e74c3c"
+    resultado_color = "#27ae60" if totales["resultado_neto"] >= 0 else "#e74c3c"
 
-    # ── Fila de totales ────────────────────────────────────────────────────
-    st.markdown("### 📑 Totales y Resultado")
-    df_totales = pd.DataFrame([
-        {"Concepto": "Total Flujo Ingresos (C10)", "Monto ($)": f"$ {totales['total_ingresos']:,.0f}".replace(",", ".")},
-        {"Concepto": "Total Flujo Egresos (C11)", "Monto ($)": f"$ {totales['total_egresos']:,.0f}".replace(",", ".")},
-        {"Concepto": "Saldo Flujo de Caja (C12)", "Monto ($)": f"$ {totales['saldo_flujo']:,.0f}".replace(",", ".")},
-        {"Concepto": "Ingresos Base Imponible (C13)", "Monto ($)": f"$ {totales['ing_bi']:,.0f}".replace(",", ".")},
-        {"Concepto": "Egresos Base Imponible (C14)", "Monto ($)": f"$ {totales['egr_bi']:,.0f}".replace(",", ".")},
-        {"Concepto": "Resultado Neto (C15)", "Monto ($)": f"$ {totales['resultado_neto']:,.0f}".replace(",", ".")},
-    ])
-    st.dataframe(df_totales, use_container_width=True, hide_index=True, height=230)
+    st.markdown(f"""
+    <div style="overflow-x:auto;">
+    <table style="width:100%; border-collapse:collapse; font-family:Arial, sans-serif; font-size:14px;">
+        <thead>
+            <tr>
+                <th colspan="6" style="background:#FFC000; color:#000; text-align:center; padding:10px; border:1px solid #ccc; font-size:15px;">
+                    SALDOS Y TOTALES LIBRO DE CAJA
+                </th>
+            </tr>
+            <tr>
+                <th colspan="3" style="background:#FFF2CC; color:#000; text-align:center; padding:8px; border:1px solid #ccc;">
+                    FLUJO DE INGRESOS Y EGRESOS
+                </th>
+                <th colspan="3" style="background:#FFF2CC; color:#000; text-align:center; padding:8px; border:1px solid #ccc;">
+                    MONTOS QUE AFECTAN LA BASE IMPONIBLE
+                </th>
+            </tr>
+            <tr>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:6px; border:1px solid #ccc; font-size:12px;">
+                    TOTAL MONTO<br>FLUJO DE<br>INGRESOS
+                </th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:6px; border:1px solid #ccc; font-size:12px;">
+                    TOTAL MONTO<br>FLUJO DE<br>EGRESOS
+                </th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:6px; border:1px solid #ccc; font-size:12px;">
+                    SALDO FLUJO<br>DE CAJA
+                </th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:6px; border:1px solid #ccc; font-size:12px;">
+                    INGRESOS
+                </th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:6px; border:1px solid #ccc; font-size:12px;">
+                    EGRESOS
+                </th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:6px; border:1px solid #ccc; font-size:12px;">
+                    RESULTADO<br>NETO
+                </th>
+            </tr>
+            <tr>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:4px; border:1px solid #ccc; font-size:11px;">C10</th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:4px; border:1px solid #ccc; font-size:11px;">C11</th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:4px; border:1px solid #ccc; font-size:11px;">C12</th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:4px; border:1px solid #ccc; font-size:11px;">C13</th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:4px; border:1px solid #ccc; font-size:11px;">C14</th>
+                <th style="background:#FFF2CC; color:#000; text-align:center; padding:4px; border:1px solid #ccc; font-size:11px;">C15</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td style="text-align:center; padding:12px; border:1px solid #ccc; font-weight:bold; font-size:15px; color:#27ae60;">
+                    {fmt_clp(totales["total_ingresos"])}
+                </td>
+                <td style="text-align:center; padding:12px; border:1px solid #ccc; font-weight:bold; font-size:15px; color:#e74c3c;">
+                    {fmt_clp(totales["total_egresos"])}
+                </td>
+                <td style="text-align:center; padding:12px; border:1px solid #ccc; font-weight:bold; font-size:15px; color:{saldo_color};">
+                    {fmt_clp(totales["saldo_flujo"])}
+                </td>
+                <td style="text-align:center; padding:12px; border:1px solid #ccc; font-weight:bold; font-size:15px; color:#27ae60;">
+                    {fmt_clp(totales["ing_bi"])}
+                </td>
+                <td style="text-align:center; padding:12px; border:1px solid #ccc; font-weight:bold; font-size:15px; color:#e74c3c;">
+                    {fmt_clp(totales["egr_bi"])}
+                </td>
+                <td style="text-align:center; padding:12px; border:1px solid #ccc; font-weight:bold; font-size:15px; color:{resultado_color};">
+                    {fmt_clp(totales["resultado_neto"])}
+                </td>
+            </tr>
+        </tbody>
+    </table>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # ── Descarga Excel ─────────────────────────────────────────────────────
+    # ── Descarga ────────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("## 💾 Exportar")
 
@@ -1261,14 +1886,31 @@ def main():
         nombre_empresa_ss,
         periodo_ss,
     )
-    nombre_archivo = f"LibroCaja_{rut_empresa_ss.replace('.', '').replace('-', '')}_{periodo_ss}.xlsx"
-    st.download_button(
-        label="📥 Descargar Libro de Caja Excel",
-        data=excel_bytes,
-        file_name=nombre_archivo,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    nombre_base = f"LibroCaja_{rut_empresa_ss.replace('.', '').replace('-', '')}_{periodo_ss}"
+
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        st.download_button(
+            label="📥 Descargar Libro de Caja (Excel)",
+            data=excel_bytes,
+            file_name=f"{nombre_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col_dl2:
+        pdf_bytes = exportar_pdf_totales(
+            totales,
+            rut_empresa_ss,
+            nombre_empresa_ss,
+            periodo_ss,
+        )
+        st.download_button(
+            label="📄 Descargar Totales (PDF)",
+            data=pdf_bytes,
+            file_name=f"{nombre_base}_Totales.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
     st.success(f"✅ Libro de Caja con {len(df_libro)} registros. Usa '🔄 Aplicar cambios' para confirmar ediciones.")
 
