@@ -1045,8 +1045,9 @@ def main():
         st.markdown("## 📋 Libro de Caja")
 
         df_display = df_libro.copy()
+        # Convertir a date puro para que data_editor muestre selector de calendario
         df_display["Fecha Operación"] = df_display["Fecha Operación"].apply(
-            lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else ""
+            lambda x: x.date() if pd.notna(x) else None
         )
 
         # Agregar nombre tipo documento
@@ -1090,44 +1091,69 @@ def main():
                 return ["background-color: #FCE4D6"] * len(row)
             return [""] * len(row)
 
-        # Editor de datos para ingresar saldo inicial
-        st.markdown("### ✏️ Editar Saldo Inicial")
-        st.caption("Ingrese el saldo inicial en la primera fila (columna 'C8 Monto Total') y presione Enter.")
-        
+        # Editor de datos: saldo inicial editable + fecha editable con calendario
+        st.markdown("### ✏️ Editar Libro de Caja")
+        st.caption("Puedes editar el saldo inicial (C8) y cambiar fechas (C6) directamente. Al cambiar una fecha, la tabla se reordenará automáticamente.")
+
         edited_df = st.data_editor(
             df_show.style.apply(color_fila, axis=1),
             use_container_width=True,
             height=520,
             disabled=[
-                "C1 N° Correlativo", "C2 Tipo Operación", "C3 N° Documento", 
-                "C4 Tipo Documento", "C5 RUT Emisor", "C6 Fecha Operación", 
+                "C1 N° Correlativo", "C2 Tipo Operación", "C3 N° Documento",
+                "C4 Tipo Documento", "C5 RUT Emisor",
                 "C7 Glosa", "C9 Base Imponible"
             ],
             column_config={
+                "C6 Fecha Operación": st.column_config.DateColumn(
+                    "C6 Fecha Operación",
+                    help="Haz clic para cambiar la fecha. La tabla se reordenará automáticamente.",
+                    format="DD/MM/YYYY",
+                ),
                 "C8 Monto Total": st.column_config.NumberColumn(
                     "C8 Monto Total",
                     help="Ingrese monto total",
                     min_value=0,
                     step=1,
                     format="$ %d",
-                )
+                ),
             },
             key="editor_tabla"
         )
 
-        # Recalcular totales con el saldo editado
+        # ── Aplicar cambios del editor a df_libro ──────────────────────────
         if edited_df is not None and not edited_df.empty:
             try:
-                # Buscar la fila de Saldo Inicial (C2 == 0)
+                # 1) Actualizar saldo inicial (C2 == 0)
                 fila_saldo = edited_df[edited_df["C2 Tipo Operación"] == 0]
                 if not fila_saldo.empty:
-                    nuevo_saldo = float(fila_saldo.iloc[0]["C8 Monto Total"])
-                    
-                    # Actualizar df_libro original para exportación y totales
+                    nuevo_saldo = float(fila_saldo.iloc[0]["C8 Monto Total"] or 0)
                     idx_saldo = df_libro[df_libro["Tipo Operación"] == 0].index
                     if not idx_saldo.empty:
                         df_libro.loc[idx_saldo[0], "C8"] = nuevo_saldo
-                        totales = calcular_totales(df_libro) # Recalcular totales con nuevo saldo
+
+                # 2) Propagar fechas editadas de vuelta a df_libro
+                for i, row in edited_df.iterrows():
+                    nueva_fecha = row.get("C6 Fecha Operación")
+                    if nueva_fecha is not None:
+                        try:
+                            df_libro.at[i, "Fecha Operación"] = pd.Timestamp(nueva_fecha)
+                        except Exception:
+                            pass
+
+                # 3) Reordenar df_libro por fecha (saldo inicial siempre primero)
+                saldo_rows = df_libro[df_libro["Tipo Operación"] == 0]
+                otros_rows = df_libro[df_libro["Tipo Operación"] != 0].sort_values(
+                    "Fecha Operación", na_position="first"
+                )
+                df_libro = pd.concat([saldo_rows, otros_rows], ignore_index=True)
+
+                # 4) Recalcular correlativo
+                df_libro["N° Correlativo"] = range(1, len(df_libro) + 1)
+
+                # 5) Recalcular totales
+                totales = calcular_totales(df_libro)
+
             except Exception:
                 pass
 
