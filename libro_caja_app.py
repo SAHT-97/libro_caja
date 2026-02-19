@@ -1090,9 +1090,10 @@ def main():
     df_libro = st.session_state["df_libro"]
     totales   = st.session_state["totales"]
     advertencias = st.session_state.get("advertencias", [])
-    rut_empresa_ss   = st.session_state.get("rut_empresa", rut_empresa or "00.000.000-0")
-    nombre_empresa_ss = st.session_state.get("nombre_empresa", nombre_empresa or "SIN NOMBRE")
-    periodo_ss        = st.session_state.get("periodo", periodo or "SIN PERÍODO")
+    # Usar siempre los valores actuales del sidebar (pueden haber cambiado sin regenerar)
+    rut_empresa_ss    = rut_empresa or st.session_state.get("rut_empresa", "00.000.000-0")
+    nombre_empresa_ss = nombre_empresa or st.session_state.get("nombre_empresa", "SIN NOMBRE")
+    periodo_ss        = periodo or st.session_state.get("periodo", "SIN PERÍODO")
     editor_ver        = st.session_state.get("editor_version", 0)
 
     # ── Advertencias ───────────────────────────────────────────────────────
@@ -1254,35 +1255,20 @@ def main():
     st.markdown("---")
     st.markdown("## 💾 Exportar")
 
-    col_dl1, col_dl2 = st.columns(2)
-
-    with col_dl1:
-        excel_bytes = exportar_excel(
-            df_libro, totales,
-            rut_empresa_ss,
-            nombre_empresa_ss,
-            periodo_ss,
-        )
-        nombre_archivo = f"LibroCaja_{rut_empresa_ss.replace('.', '').replace('-', '')}_{periodo_ss}.xlsx"
-        st.download_button(
-            label="📥 Descargar Libro de Caja Excel",
-            data=excel_bytes,
-            file_name=nombre_archivo,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    with col_dl2:
-        csv_export = df_libro.drop(columns=["_origen"], errors="ignore").to_csv(
-            index=False, sep=";", encoding="utf-8-sig"
-        )
-        st.download_button(
-            label="📥 Descargar CSV (backup)",
-            data=csv_export.encode("utf-8-sig"),
-            file_name=f"LibroCaja_{periodo_ss}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    excel_bytes = exportar_excel(
+        df_libro, totales,
+        rut_empresa_ss,
+        nombre_empresa_ss,
+        periodo_ss,
+    )
+    nombre_archivo = f"LibroCaja_{rut_empresa_ss.replace('.', '').replace('-', '')}_{periodo_ss}.xlsx"
+    st.download_button(
+        label="📥 Descargar Libro de Caja Excel",
+        data=excel_bytes,
+        file_name=nombre_archivo,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
     st.success(f"✅ Libro de Caja con {len(df_libro)} registros. Usa '🔄 Aplicar cambios' para confirmar ediciones.")
 
