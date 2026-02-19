@@ -989,244 +989,57 @@ def main():
     st.markdown("---")
     col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
     with col_btn2:
-        if st.button("⚙️ GENERAR LIBRO DE CAJA", use_container_width=True):
-            st.session_state.proceso_activo = True
+        boton_generar = st.button("⚙️ GENERAR LIBRO DE CAJA", use_container_width=True)
 
-    if st.session_state.get("proceso_activo", False):
+    # Cuando se presiona el botón, regenerar desde cero y guardar en session_state
+    if boton_generar:
         if not archivos_ventas and not archivos_resumen and not archivos_compras:
             st.error("❌ Debe cargar al menos un archivo CSV para procesar.")
-            return
+        else:
+            if not rut_empresa or not nombre_empresa or not periodo:
+                st.warning("⚠️ Complete los datos de la empresa en el panel lateral antes de procesar.")
 
-        if not rut_empresa or not nombre_empresa or not periodo:
-            st.warning("⚠️ Complete los datos de la empresa en el panel lateral antes de procesar.")
+            with st.spinner("Procesando archivos..."):
+                df_ventas = pd.DataFrame()
+                df_compras = pd.DataFrame()
 
-        with st.spinner("Procesando archivos..."):
-            # Procesar
-            df_ventas = pd.DataFrame()
-            df_compras = pd.DataFrame()
+                if archivos_ventas or archivos_resumen:
+                    try:
+                        df_ventas = procesamiento_ventas(
+                            archivos_ventas or [],
+                            archivos_resumen or [],
+                            periodo or "",
+                        )
+                    except Exception as e:
+                        st.error(f"❌ Error procesando ventas: {e}")
 
-            if archivos_ventas or archivos_resumen:
-                try:
-                    df_ventas = procesamiento_ventas(
-                        archivos_ventas or [],
-                        archivos_resumen or [],
-                        periodo or "",
-                    )
-                except Exception as e:
-                    st.error(f"❌ Error procesando ventas: {e}")
+                if archivos_compras:
+                    try:
+                        df_compras = procesamiento_compras(archivos_compras)
+                    except Exception as e:
+                        st.error(f"❌ Error procesando compras: {e}")
 
-            if archivos_compras:
-                try:
-                    df_compras = procesamiento_compras(archivos_compras)
-                except Exception as e:
-                    st.error(f"❌ Error procesando compras: {e}")
-
-            saldo_inicial = 0.0  # Se editará en la tabla
-
-            df_libro = generar_libro_caja(
-                df_ventas, df_compras,
-                saldo_inicial,
-                rut_empresa or "00.000.000-0",
-                nombre_empresa or "SIN NOMBRE",
-                periodo or "SIN PERÍODO",
-            )
-
-            totales = calcular_totales(df_libro)
-            advertencias = validar_libro(df_libro)
-
-        # ── Advertencias ───────────────────────────────────────────────────
-        if advertencias:
-            st.markdown("### ⚠️ Advertencias de Validación")
-            for adv in advertencias:
-                st.warning(adv)
-
-        # ── KPIs ───────────────────────────────────────────────────────────
-
-        st.markdown("## 📋 Libro de Caja")
-
-        df_display = df_libro.copy()
-        # Convertir a date puro para que data_editor muestre selector de calendario
-        df_display["Fecha Operación"] = df_display["Fecha Operación"].apply(
-            lambda x: x.date() if pd.notna(x) else None
-        )
-
-        # Agregar nombre tipo documento
-        def tipo_doc_label(v):
-            try:
-                codigo = int(float(str(v))) if str(v).strip() else 0
-                nombre = TIPO_DOC_NOMBRES.get(codigo, "")
-                return f"({codigo}) {nombre}" if nombre else str(v)
-            except Exception:
-                return str(v)
-
-        df_display["Tipo Documento"] = df_display["Tipo Documento"].apply(tipo_doc_label)
-
-        df_display["C9"] = df_display["C9"].apply(
-            lambda x: f"$ {x:,.0f}".replace(",", ".") if x else ""
-        )
-
-        # Ajuste: No formatear C8 aquí para permitir edición numérica en data_editor
-        # El formato visual se maneja en column_config
-
-        # Renombrar columnas para display (Encabezados descriptivos)
-        df_show = df_display.rename(columns={
-            "N° Correlativo": "C1 N° Correlativo",
-            "Tipo Operación": "C2 Tipo Operación",
-            "N° Documento": "C3 N° Documento",
-            "Tipo Documento": "C4 Tipo Documento",
-            "RUT Emisor": "C5 RUT Emisor",
-            "Fecha Operación": "C6 Fecha Operación",
-            "Glosa de Operación": "C7 Glosa",
-            "C8": "C8 Monto Total",
-            "C9": "C9 Base Imponible",
-        }).drop(columns=["_origen"], errors="ignore")
-
-        # Colorear filas según tipo
-        def color_fila(row):
-            if row["C2 Tipo Operación"] == 0:
-                return ["background-color: #BDD7EE"] * len(row)
-            elif row["C2 Tipo Operación"] == 1:
-                return ["background-color: #E2EFDA"] * len(row)
-            elif row["C2 Tipo Operación"] == 2:
-                return ["background-color: #FCE4D6"] * len(row)
-            return [""] * len(row)
-
-        # Editor de datos: saldo inicial editable + fecha editable con calendario
-        st.markdown("### ✏️ Editar Libro de Caja")
-        st.caption("Puedes editar el saldo inicial (C8) y cambiar fechas (C6) directamente. Al cambiar una fecha, la tabla se reordenará automáticamente.")
-
-        edited_df = st.data_editor(
-            df_show.style.apply(color_fila, axis=1),
-            use_container_width=True,
-            height=520,
-            disabled=[
-                "C1 N° Correlativo", "C2 Tipo Operación", "C3 N° Documento",
-                "C4 Tipo Documento", "C5 RUT Emisor",
-                "C7 Glosa", "C9 Base Imponible"
-            ],
-            column_config={
-                "C6 Fecha Operación": st.column_config.DateColumn(
-                    "C6 Fecha Operación",
-                    help="Haz clic para cambiar la fecha. La tabla se reordenará automáticamente.",
-                    format="DD/MM/YYYY",
-                ),
-                "C8 Monto Total": st.column_config.NumberColumn(
-                    "C8 Monto Total",
-                    help="Ingrese monto total",
-                    min_value=0,
-                    step=1,
-                    format="$ %d",
-                ),
-            },
-            key="editor_tabla"
-        )
-
-        # ── Aplicar cambios del editor a df_libro ──────────────────────────
-        if edited_df is not None and not edited_df.empty:
-            try:
-                # 1) Actualizar saldo inicial (C2 == 0)
-                fila_saldo = edited_df[edited_df["C2 Tipo Operación"] == 0]
-                if not fila_saldo.empty:
-                    nuevo_saldo = float(fila_saldo.iloc[0]["C8 Monto Total"] or 0)
-                    idx_saldo = df_libro[df_libro["Tipo Operación"] == 0].index
-                    if not idx_saldo.empty:
-                        df_libro.loc[idx_saldo[0], "C8"] = nuevo_saldo
-
-                # 2) Propagar fechas editadas de vuelta a df_libro
-                for i, row in edited_df.iterrows():
-                    nueva_fecha = row.get("C6 Fecha Operación")
-                    if nueva_fecha is not None:
-                        try:
-                            df_libro.at[i, "Fecha Operación"] = pd.Timestamp(nueva_fecha)
-                        except Exception:
-                            pass
-
-                # 3) Reordenar df_libro por fecha (saldo inicial siempre primero)
-                saldo_rows = df_libro[df_libro["Tipo Operación"] == 0]
-                otros_rows = df_libro[df_libro["Tipo Operación"] != 0].sort_values(
-                    "Fecha Operación", na_position="first"
+                df_libro_nuevo = generar_libro_caja(
+                    df_ventas, df_compras,
+                    0.0,
+                    rut_empresa or "00.000.000-0",
+                    nombre_empresa or "SIN NOMBRE",
+                    periodo or "SIN PERÍODO",
                 )
-                df_libro = pd.concat([saldo_rows, otros_rows], ignore_index=True)
 
-                # 4) Recalcular correlativo
-                df_libro["N° Correlativo"] = range(1, len(df_libro) + 1)
+                advertencias = validar_libro(df_libro_nuevo)
 
-                # 5) Recalcular totales
-                totales = calcular_totales(df_libro)
+                # Guardar en session_state (fuente de verdad persistente)
+                st.session_state["df_libro"] = df_libro_nuevo
+                st.session_state["totales"] = calcular_totales(df_libro_nuevo)
+                st.session_state["advertencias"] = advertencias
+                st.session_state["editor_version"] = 0  # Reiniciar el editor
+                st.session_state["rut_empresa"] = rut_empresa
+                st.session_state["nombre_empresa"] = nombre_empresa
+                st.session_state["periodo"] = periodo
 
-            except Exception:
-                pass
-
-        # Leyenda
-        col_l1, col_l2, col_l3 = st.columns(3)
-        col_l1.markdown("🔵 **Saldo Inicial**")
-        col_l2.markdown("🟢 **Flujo Ingreso**")
-        col_l3.markdown("🔴 **Flujo Egreso**")
-
-        # ── KPIs (Ahora se muestran después de editar) ────────────────────
-        st.markdown("## 📊 Resumen del Período")
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-        def fmt_clp(v):
-            return f"${v:,.0f}".replace(",", ".")
-
-        k1.metric("Total Ingresos (C10)", fmt_clp(totales["total_ingresos"]))
-        k2.metric("Total Egresos (C11)", fmt_clp(totales["total_egresos"]))
-        k3.metric("Saldo Flujo Caja (C12)", fmt_clp(totales["saldo_flujo"]))
-        k4.metric("Ingresos BI (C13)", fmt_clp(totales["ing_bi"]))
-        k5.metric("Egresos BI (C14)", fmt_clp(totales["egr_bi"]))
-        resultado_delta = "▲ Positivo" if totales["resultado_neto"] >= 0 else "▼ Negativo"
-        k6.metric("Resultado Neto (C15)", fmt_clp(totales["resultado_neto"]), delta=resultado_delta)
-
-
-        # ── Fila de totales ────────────────────────────────────────────────
-        st.markdown("### 📑 Totales y Resultado")
-        df_totales = pd.DataFrame([
-            {"Concepto": "Total Flujo Ingresos (C10)", "Monto ($)": f"$ {totales['total_ingresos']:,.0f}".replace(",", ".")},
-            {"Concepto": "Total Flujo Egresos (C11)", "Monto ($)": f"$ {totales['total_egresos']:,.0f}".replace(",", ".")},
-            {"Concepto": "Saldo Flujo de Caja (C12)", "Monto ($)": f"$ {totales['saldo_flujo']:,.0f}".replace(",", ".")},
-            {"Concepto": "Ingresos Base Imponible (C13)", "Monto ($)": f"$ {totales['ing_bi']:,.0f}".replace(",", ".")},
-            {"Concepto": "Egresos Base Imponible (C14)", "Monto ($)": f"$ {totales['egr_bi']:,.0f}".replace(",", ".")},
-            {"Concepto": "Resultado Neto (C15)", "Monto ($)": f"$ {totales['resultado_neto']:,.0f}".replace(",", ".")},
-        ])
-        st.dataframe(df_totales, use_container_width=True, hide_index=True, height=230)
-
-        # ── Descarga Excel ─────────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("## 💾 Exportar")
-
-        col_dl1, col_dl2 = st.columns(2)
-
-        with col_dl1:
-            excel_bytes = exportar_excel(
-                df_libro, totales,
-                rut_empresa or "00.000.000-0",
-                nombre_empresa or "SIN NOMBRE",
-                periodo or "SIN PERÍODO",
-            )
-            nombre_archivo = f"LibroCaja_{(rut_empresa or 'empresa').replace('.', '').replace('-', '')}_{periodo or 'periodo'}.xlsx"
-            st.download_button(
-                label="📥 Descargar Libro de Caja Excel",
-                data=excel_bytes,
-                file_name=nombre_archivo,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-        with col_dl2:
-            csv_export = df_libro.drop(columns=["_origen"], errors="ignore").to_csv(
-                index=False, sep=";", encoding="utf-8-sig"
-            )
-            st.download_button(
-                label="📥 Descargar CSV (backup)",
-                data=csv_export.encode("utf-8-sig"),
-                file_name=f"LibroCaja_{periodo or 'periodo'}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-        st.success(f"✅ Libro de Caja generado exitosamente con {len(df_libro)} registros.")
-
-    else:
+    # ── Mostrar tabla si ya fue generada ──────────────────────────────────
+    if "df_libro" not in st.session_state:
         # ── Estado inicial: instrucciones ──────────────────────────────────
         st.info("""
         **Cómo usar esta aplicación:**
@@ -1271,7 +1084,209 @@ def main():
             - Base imponible = Neto + Exento
             - Régimen Art. 14 D N°3 y N°8(a) LIR
             """)
+        return
+
+    # ── Leer desde session_state ───────────────────────────────────────────
+    df_libro = st.session_state["df_libro"]
+    totales   = st.session_state["totales"]
+    advertencias = st.session_state.get("advertencias", [])
+    rut_empresa_ss   = st.session_state.get("rut_empresa", rut_empresa or "00.000.000-0")
+    nombre_empresa_ss = st.session_state.get("nombre_empresa", nombre_empresa or "SIN NOMBRE")
+    periodo_ss        = st.session_state.get("periodo", periodo or "SIN PERÍODO")
+    editor_ver        = st.session_state.get("editor_version", 0)
+
+    # ── Advertencias ───────────────────────────────────────────────────────
+    if advertencias:
+        st.markdown("### ⚠️ Advertencias de Validación")
+        for adv in advertencias:
+            st.warning(adv)
+
+    st.markdown("## 📋 Libro de Caja")
+
+    # Preparar df para mostrar (no modifica session_state)
+    df_display = df_libro.copy()
+    df_display["Fecha Operación"] = df_display["Fecha Operación"].apply(
+        lambda x: x.date() if pd.notna(x) else None
+    )
+
+    def tipo_doc_label(v):
+        try:
+            codigo = int(float(str(v))) if str(v).strip() else 0
+            nombre = TIPO_DOC_NOMBRES.get(codigo, "")
+            return f"({codigo}) {nombre}" if nombre else str(v)
+        except Exception:
+            return str(v)
+
+    df_display["Tipo Documento"] = df_display["Tipo Documento"].apply(tipo_doc_label)
+    df_display["C9"] = df_display["C9"].apply(
+        lambda x: f"$ {x:,.0f}".replace(",", ".") if x else ""
+    )
+
+    df_show = df_display.rename(columns={
+        "N° Correlativo": "C1 N° Correlativo",
+        "Tipo Operación": "C2 Tipo Operación",
+        "N° Documento": "C3 N° Documento",
+        "Tipo Documento": "C4 Tipo Documento",
+        "RUT Emisor": "C5 RUT Emisor",
+        "Fecha Operación": "C6 Fecha Operación",
+        "Glosa de Operación": "C7 Glosa",
+        "C8": "C8 Monto Total",
+        "C9": "C9 Base Imponible",
+    }).drop(columns=["_origen"], errors="ignore")
+
+    def color_fila(row):
+        if row["C2 Tipo Operación"] == 0:
+            return ["background-color: #BDD7EE"] * len(row)
+        elif row["C2 Tipo Operación"] == 1:
+            return ["background-color: #E2EFDA"] * len(row)
+        elif row["C2 Tipo Operación"] == 2:
+            return ["background-color: #FCE4D6"] * len(row)
+        return [""] * len(row)
+
+    st.markdown("### ✏️ Editar Libro de Caja")
+    st.caption("Edita el saldo inicial (C8) y las fechas (C6). Al confirmar cambios, la tabla se reordenará y el correlativo se recalculará.")
+
+    # Clave dinámica: cuando se incrementa editor_version, el editor se reinicia
+    # con los datos ya ordenados de session_state
+    edited_df = st.data_editor(
+        df_show.style.apply(color_fila, axis=1),
+        use_container_width=True,
+        height=520,
+        disabled=[
+            "C1 N° Correlativo", "C2 Tipo Operación", "C3 N° Documento",
+            "C4 Tipo Documento", "C5 RUT Emisor",
+            "C7 Glosa", "C9 Base Imponible"
+        ],
+        column_config={
+            "C6 Fecha Operación": st.column_config.DateColumn(
+                "C6 Fecha Operación",
+                help="Haz clic para cambiar la fecha. Luego presiona 'Aplicar cambios'.",
+                format="DD/MM/YYYY",
+            ),
+            "C8 Monto Total": st.column_config.NumberColumn(
+                "C8 Monto Total",
+                help="Ingrese monto total",
+                min_value=0,
+                step=1,
+                format="$ %d",
+            ),
+        },
+        key=f"editor_tabla_{editor_ver}"
+    )
+
+    # Botón para aplicar cambios explícitamente (reordena y recalcula)
+    col_ap1, col_ap2, col_ap3 = st.columns([1, 2, 1])
+    with col_ap2:
+        if st.button("🔄 Aplicar cambios y reordenar", use_container_width=True, key="btn_aplicar"):
+            if edited_df is not None and not edited_df.empty:
+                try:
+                    df_trabajo = df_libro.copy()
+
+                    # 1) Actualizar saldo inicial
+                    fila_saldo = edited_df[edited_df["C2 Tipo Operación"] == 0]
+                    if not fila_saldo.empty:
+                        nuevo_saldo = float(fila_saldo.iloc[0]["C8 Monto Total"] or 0)
+                        idx_saldo = df_trabajo[df_trabajo["Tipo Operación"] == 0].index
+                        if not idx_saldo.empty:
+                            df_trabajo.loc[idx_saldo[0], "C8"] = nuevo_saldo
+
+                    # 2) Propagar fechas editadas
+                    for i, row in edited_df.iterrows():
+                        nueva_fecha = row.get("C6 Fecha Operación")
+                        if nueva_fecha is not None and i < len(df_trabajo):
+                            try:
+                                df_trabajo.at[i, "Fecha Operación"] = pd.Timestamp(nueva_fecha)
+                            except Exception:
+                                pass
+
+                    # 3) Reordenar: saldo inicial siempre primero, resto por fecha
+                    saldo_rows = df_trabajo[df_trabajo["Tipo Operación"] == 0].copy()
+                    otros_rows = df_trabajo[df_trabajo["Tipo Operación"] != 0].sort_values(
+                        "Fecha Operación", na_position="first"
+                    )
+                    df_trabajo = pd.concat([saldo_rows, otros_rows], ignore_index=True)
+
+                    # 4) Recalcular correlativo
+                    df_trabajo["N° Correlativo"] = range(1, len(df_trabajo) + 1)
+
+                    # 5) Guardar en session_state y forzar reinicio del editor
+                    st.session_state["df_libro"] = df_trabajo
+                    st.session_state["totales"] = calcular_totales(df_trabajo)
+                    st.session_state["editor_version"] = editor_ver + 1
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Error al aplicar cambios: {e}")
+
+    # Leyenda
+    col_l1, col_l2, col_l3 = st.columns(3)
+    col_l1.markdown("🔵 **Saldo Inicial**")
+    col_l2.markdown("🟢 **Flujo Ingreso**")
+    col_l3.markdown("🔴 **Flujo Egreso**")
+
+    # ── KPIs ──────────────────────────────────────────────────────────────
+    st.markdown("## 📊 Resumen del Período")
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    def fmt_clp(v):
+        return f"${v:,.0f}".replace(",", ".")
+
+    k1.metric("Total Ingresos (C10)", fmt_clp(totales["total_ingresos"]))
+    k2.metric("Total Egresos (C11)", fmt_clp(totales["total_egresos"]))
+    k3.metric("Saldo Flujo Caja (C12)", fmt_clp(totales["saldo_flujo"]))
+    k4.metric("Ingresos BI (C13)", fmt_clp(totales["ing_bi"]))
+    k5.metric("Egresos BI (C14)", fmt_clp(totales["egr_bi"]))
+    resultado_delta = "▲ Positivo" if totales["resultado_neto"] >= 0 else "▼ Negativo"
+    k6.metric("Resultado Neto (C15)", fmt_clp(totales["resultado_neto"]), delta=resultado_delta)
+
+    # ── Fila de totales ────────────────────────────────────────────────────
+    st.markdown("### 📑 Totales y Resultado")
+    df_totales = pd.DataFrame([
+        {"Concepto": "Total Flujo Ingresos (C10)", "Monto ($)": f"$ {totales['total_ingresos']:,.0f}".replace(",", ".")},
+        {"Concepto": "Total Flujo Egresos (C11)", "Monto ($)": f"$ {totales['total_egresos']:,.0f}".replace(",", ".")},
+        {"Concepto": "Saldo Flujo de Caja (C12)", "Monto ($)": f"$ {totales['saldo_flujo']:,.0f}".replace(",", ".")},
+        {"Concepto": "Ingresos Base Imponible (C13)", "Monto ($)": f"$ {totales['ing_bi']:,.0f}".replace(",", ".")},
+        {"Concepto": "Egresos Base Imponible (C14)", "Monto ($)": f"$ {totales['egr_bi']:,.0f}".replace(",", ".")},
+        {"Concepto": "Resultado Neto (C15)", "Monto ($)": f"$ {totales['resultado_neto']:,.0f}".replace(",", ".")},
+    ])
+    st.dataframe(df_totales, use_container_width=True, hide_index=True, height=230)
+
+    # ── Descarga Excel ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## 💾 Exportar")
+
+    col_dl1, col_dl2 = st.columns(2)
+
+    with col_dl1:
+        excel_bytes = exportar_excel(
+            df_libro, totales,
+            rut_empresa_ss,
+            nombre_empresa_ss,
+            periodo_ss,
+        )
+        nombre_archivo = f"LibroCaja_{rut_empresa_ss.replace('.', '').replace('-', '')}_{periodo_ss}.xlsx"
+        st.download_button(
+            label="📥 Descargar Libro de Caja Excel",
+            data=excel_bytes,
+            file_name=nombre_archivo,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    with col_dl2:
+        csv_export = df_libro.drop(columns=["_origen"], errors="ignore").to_csv(
+            index=False, sep=";", encoding="utf-8-sig"
+        )
+        st.download_button(
+            label="📥 Descargar CSV (backup)",
+            data=csv_export.encode("utf-8-sig"),
+            file_name=f"LibroCaja_{periodo_ss}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.success(f"✅ Libro de Caja con {len(df_libro)} registros. Usa '🔄 Aplicar cambios' para confirmar ediciones.")
 
 
 if __name__ == "__main__":
     main()
+
