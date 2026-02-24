@@ -287,18 +287,21 @@ def _fecha_fallback_desde_nombre(nombre_archivo: str, periodo: str) -> pd.Timest
     """
     Intenta extraer año y mes del nombre del archivo.
     Busca patrones como: 2024-11, 202411, nov2024, etc.
+    Prioriza los números al final del archivo.
     Si no encuentra nada, usa el 31/12 del año del período.
     """
     # Buscar patrón YYYY-MM o YYYYMM en el nombre del archivo
-    match = re.search(r"(\d{4})[_\-]?(\d{2})", nombre_archivo)
-    if match:
-        anio = int(match.group(1))
-        mes = int(match.group(2))
-        if 2000 <= anio <= 2100 and 1 <= mes <= 12:
-            # Último día del mes
-            import calendar
-            ultimo_dia = calendar.monthrange(anio, mes)[1]
-            return pd.Timestamp(f"{anio}-{mes:02d}-{ultimo_dia}")
+    # Usamos findall y leemos al revés para evitar confundir fechas con el RUT
+    matches = re.findall(r"(20[0-9]{2})[_\-]?([0-9]{2})", nombre_archivo)
+    if matches:
+        for m in reversed(matches):
+            anio = int(m[0])
+            mes = int(m[1])
+            if 2000 <= anio <= 2100 and 1 <= mes <= 12:
+                # Último día del mes
+                import calendar
+                ultimo_dia = calendar.monthrange(anio, mes)[1]
+                return pd.Timestamp(f"{anio}-{mes:02d}-{ultimo_dia}")
 
     # Fallback: último día del año del período ingresado por el usuario
     anio_periodo = str(periodo).strip()
@@ -392,14 +395,9 @@ def _procesar_resumen_ventas(df: pd.DataFrame, nombre: str, registros: list, per
 
 
         # Fecha
-        if col_fecha:
-            fecha = parsear_fecha(fila.get(col_fecha, ""))
-            if fecha is None:
-                # Intentar extraer del nombre del archivo cuando la celda no parsea
-                fecha = _fecha_fallback_desde_nombre(nombre, periodo)
-        else:
-            # Sin columna fecha: extraer del nombre del archivo o usar período
-            fecha = _fecha_fallback_desde_nombre(nombre, periodo)
+        # Solicitado explícitamente: trasladar el periodo por su último día del mes
+        # cortando el nombre del archivo, solo en la subida de las boletas.
+        fecha = _fecha_fallback_desde_nombre(nombre, periodo)
 
         if fecha is None:
             continue
